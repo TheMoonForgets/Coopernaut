@@ -1,0 +1,49 @@
+# Deliberately incomplete: choose experiment settings before running.
+# CLI-required paths, device, workers, training values, and seed replace nulls.
+data: null
+publication_manifest: null  # Required CLI path; exact train/validation episode -> actual publication JSONL.
+publication_log_dir: null  # Optional, explicitly chosen online trace directory.
+daggerdata: null
+eval_data: null
+device: null
+num_dataloader_workers: null
+batch_size: null
+num_epochs: null
+seed: null
+
+# Original sparse CPT architecture / input convention.
+cpt: true
+npoints: 2048
+nblocks: 2
+input_dim: 3
+transformer_dim: 32
+nneighbor: 16
+num_commands: 6
+num_hidden: 256
+num_output: 3
+max_num_neighbors: 3
+ego_only: true
+shared: false
+earlyfusion: false
+use_lidar: false
+visualize: false
+uniform: false
+frame_stack: 1  # Legacy field; TARC history is built separately by sender/frame.
+
+temporal:
+  enabled: true
+  rr_gate: false  # Train TARC once; enable rules on the same trained weights.
+  delay_ms: null  # Explicit non-negative integer, multiple of 50 ms.
+  match_radius_m: null  # Explicit positive radius in metres.
+  match_weighting: null  # inverse_distance | softmax_squared_distance
+  match_temperature: null  # Positive; required for softmax_squared_distance.
+  residual_hidden_dim: null  # Explicit positive integer.
+  quality_hidden_dim: null  # Explicit positive integer.
+  activation: null  # relu | gelu; choose explicitly.
+  time_encoding: null  # linear | sinusoidal; choose explicitly.
+  # Required CLI values populate these; non-null conflicts are rejected.
+  beta: null
+  sigma: null
+  weight_decay: null
+  epochs: null
+  batch_size: null

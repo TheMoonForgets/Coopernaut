@@ -104,6 +104,17 @@ python scripts/result_analysis.py --root ${PATH_TO_YOUR_OUTPUT_DIR}
 python scripts/compare_trajectory.py --eval ${PATH_TO_YOUR_OUTPUT_DIR} --expert ${PATH_TO_EXPERT}
 ```
 
+## TARC and RR-Gate
+
+An optional temporal path adds four-message sparse-feature compensation and a
+fixed reliability/risk gate before cross-vehicle voxel pooling. The original
+model remains the default when temporal mode is absent or disabled.
+
+See [the implementation and training guide](docs/TARC_RRGATE.md) and
+[the explicit configuration template](configs/tarc.example.yaml). Experimental
+settings must be supplied; the template deliberately contains required nulls.
+No trained TARC checkpoint or new driving-performance results are included.
+
 ## Citation
 ```bibtex
 @inproceedings{cui2022coopernaut,
@@ -113,3 +124,4 @@ python scripts/compare_trajectory.py --eval ${PATH_TO_YOUR_OUTPUT_DIR} --expert 
     year = {2022}
 }
 ```
+

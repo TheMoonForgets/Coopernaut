@@ -4,6 +4,11 @@ import random
 import open3d.ml.torch as ml3d
 from .pointnet_util import PointNetFeaturePropagation, PointNetSetAbstraction
 from .transformer_block import TransformerBlock
+from cooperative.config import TemporalConfig
+from cooperative.messages import CausalMessageBuffer
+from cooperative.rr_gate import risk_from_ttc, compute_gate, apply_log_gate
+from cooperative.tarc import TARC
+from cooperative.pooling import zero_floor_backward
 
 
 class TransitionDown(nn.Module):
@@ -158,7 +163,221 @@ class CooperativePointTransformer(nn.Module):
             )
         self.voxel_pooling = ml3d.layers.VoxelPooling(position_fn='average', feature_fn='max')
 
-    def forward(self, ego_lidar, ego_speed, other_lidar, other_transform):
+        # No new parameters or random draws on the legacy/disabled path.
+        self.temporal_config = TemporalConfig.from_config(config)
+        self.temporal_aux = []
+        self.temporal_trace = []
+        self.temporal_publications = None
+        self._temporal_episode = None
+        if self.temporal_config is not None:
+            if npoints != 2048 or nblocks != 2 or d_points != 3 or simple:
+                raise ValueError('TARC requires the 2048-point, two-block, 128-feature CPT backbone')
+            self.tarc = TARC(self.temporal_config)
+            self.message_buffer = CausalMessageBuffer(self.temporal_config.delay_ms)
+
+    def reset_temporal_state(self):
+        """Reset inference history at an episode/reconnection boundary."""
+        if self.temporal_config is not None:
+            self.message_buffer.reset()
+        self._temporal_episode = None
+        self.temporal_aux = []
+        self.temporal_trace = []
+        self.temporal_publications = None
+
+    def forward(self, ego_lidar, ego_speed, other_lidar, other_transform,
+                temporal_context=None, temporal_batch=None):
+        if self.temporal_config is None:
+            return self._forward_legacy(ego_lidar, ego_speed, other_lidar, other_transform)
+        if (temporal_context is None) == (temporal_batch is None):
+            raise ValueError('Enabled TARC needs exactly one of temporal_context or temporal_batch')
+        self.temporal_aux = []
+        self.temporal_trace = []
+        if temporal_batch is not None:
+            self.temporal_publications = None
+            return self._forward_temporal_batch(ego_lidar, ego_speed, temporal_batch)
+        if self.training:
+            raise ValueError('Online message caches are inference-only; train with temporal_batch')
+        with torch.no_grad():
+            return self._forward_temporal_online(ego_lidar, ego_speed, other_lidar, temporal_context)
+
+    @staticmethod
+    def _transform_xyz(xyz, transform):
+        # Match the existing coordinate transform; never rotate feature channels.
+        return torch.transpose(torch.matmul(transform[:, :3, :3],
+                                            torch.transpose(xyz, 1, 2)), 1, 2) + torch.cat(
+            xyz.shape[1] * [transform[:, :3, 3].unsqueeze(1)], dim=1)
+
+    def _gate_output(self, output, age, speed_mps, ttc):
+        if not self.temporal_config.rr_gate:
+            return output['features'], None
+        risk, ttc_valid = risk_from_ttc(ttc, speed_mps)
+        gate = compute_gate(output['quality'], age, risk)
+        return apply_log_gate(output['features'], gate), {
+            'risk': risk.detach(), 'ttc_valid': ttc_valid.detach(), 'gate': gate.detach()}
+
+    def _forward_temporal_online(self, ego_lidar, ego_speed, other_lidar, context):
+        if ego_lidar.size(0) != 1 or other_lidar.size(0) != 1:
+            raise ValueError('Online context represents one episode; use temporal_batch for batches')
+        slots = context['slots']
+        if len(slots) != other_lidar.size(1):
+            raise ValueError('Temporal slots must match the original neighbor tensor')
+        episode = context['episode_id']
+        if episode != self._temporal_episode:
+            self.reset_temporal_state()
+            self._temporal_episode = episode
+        now = context['now_tick']
+        self.message_buffer.advance(now)
+        points, xyz, _ = self.backbone(ego_lidar)
+        ego_inverse = torch.as_tensor(context['ego_inverse'], device=xyz.device, dtype=xyz.dtype)
+        if ego_inverse.shape != (4, 4) or not torch.isfinite(ego_inverse).all():
+            raise ValueError('ego_inverse must be a finite 4x4 capture-compatible transform')
+        speed = torch.as_tensor(context['ego_speed_mps'], device=xyz.device, dtype=xyz.dtype)
+        candidates = []
+        self.temporal_publications = {
+            'schema_version': 1, 'episode_id': str(episode), 'decision_tick': now,
+            'slots': [source['sender_id'] for source in slots], 'published': []}
+        for slot, source in enumerate(slots):
+            sender = source['sender_id']
+            if sender is None:
+                continue
+            if source.get('sensor_frame') is not None and source['sensor_frame'] != source['capture_tick']:
+                raise ValueError('Schema 1 uses the same absolute world frame for capture_tick and sensor_frame')
+            # A missing capture pose must never be replaced with the current pose.
+            if source.get('sender_world') is not None:
+                features, positions, _ = self.backbone_other(other_lidar[:, slot])
+                pose = torch.as_tensor(source['sender_world'], device=xyz.device, dtype=xyz.dtype)
+                published = self.message_buffer.publish(sender, source['capture_tick'], features[0],
+                                                        positions[0], pose, source.get('sensor_frame'))
+                if published:
+                    self.temporal_publications['published'].append({
+                        'sender_id': sender, 'capture_tick': source['capture_tick'],
+                        'sensor_frame': source['capture_tick'] if source.get('sensor_frame') is None else source['sensor_frame'],
+                        'publish_tick': now})
+                self.message_buffer.advance(now)
+            history = self.message_buffer.consume_history(sender)
+            if not history:
+                self.temporal_trace.append({'sender_id': sender, 'valid': False})
+                continue
+            local_features = torch.stack([message.features for message in history])
+            aligned_xyz = torch.cat([
+                self._transform_xyz(message.xyz.unsqueeze(0),
+                                    (ego_inverse @ message.sender_world).unsqueeze(0))
+                for message in history], dim=0)
+            ages = xyz.new_tensor([(now - message.capture_tick) * 0.05 for message in history])
+            valid = torch.ones(len(history), device=xyz.device, dtype=torch.bool)
+            output = self.tarc(local_features, aligned_xyz, ages, valid)
+            ttc = context.get('ttc_s')
+            ttc = None if ttc is None else torch.as_tensor(ttc[slot], device=xyz.device, dtype=xyz.dtype)
+            fused_features, gate_trace = self._gate_output(output, ages[-1], speed, ttc)
+            candidates.append((output['xyz'], fused_features))
+            self.temporal_trace.append({
+                'sender_id': sender, 'valid': True,
+                'capture_ticks': [message.capture_tick for message in history],
+                'age_s': ages[-1].detach(), 'quality': output['quality'].detach(),
+                'gate': gate_trace, 'prefusion_xyz': output['xyz'].detach(),
+                'compensated_features': output['features'].detach(),
+                'prefusion_features': fused_features.detach()})
+        return self._fuse_temporal(points, xyz, ego_speed, [candidates])
+
+    def _forward_temporal_batch(self, ego_lidar, ego_speed, batch):
+        history_lidar = batch['history_lidar'].to(device=ego_lidar.device, dtype=ego_lidar.dtype)
+        transforms = batch['history_transform'].to(device=ego_lidar.device, dtype=ego_lidar.dtype)
+        ages = batch['history_age_s'].to(device=ego_lidar.device, dtype=ego_lidar.dtype)
+        valid = batch['history_valid'].to(device=ego_lidar.device, dtype=torch.bool)
+        speed = batch['ego_speed_mps'].to(device=ego_lidar.device, dtype=ego_lidar.dtype)
+        if history_lidar.ndim != 5 or history_lidar.shape[0] != ego_lidar.shape[0]:
+            raise ValueError('history_lidar must be [B,M,H,P,3]')
+        bsize, neighbors, frames, npoints, channels = history_lidar.shape
+        if frames != 4 or npoints != self.npoints or channels != 3:
+            raise ValueError('TARC batches require four history positions and original point count')
+        if transforms.shape != (bsize, neighbors, frames, 4, 4) or ages.shape != valid.shape or valid.shape != (bsize, neighbors, frames):
+            raise ValueError('History geometry, ages and masks must share [B,M,H] indices')
+        if speed.shape != (bsize,):
+            raise ValueError('ego_speed_mps must be [B], in physical m/s')
+        if torch.any(ages[valid] < self.temporal_config.delay_ms / 1000.0):
+            raise ValueError('History contains a message not yet delivered at the configured delay')
+        points, xyz, _ = self.backbone(ego_lidar)
+        all_candidates = []
+        for b in range(bsize):
+            candidates = []
+            for sender in range(neighbors):
+                mask = valid[b, sender]
+                if not bool(mask.any()):
+                    continue
+                encoded, positions, _ = self.backbone_other(history_lidar[b, sender, mask])
+                aligned = self._transform_xyz(positions, transforms[b, sender, mask])
+                selected_ages = ages[b, sender, mask]
+                output = self.tarc(encoded, aligned, selected_ages,
+                                   torch.ones_like(selected_ages, dtype=torch.bool))
+                ttc = batch.get('ttc_s')
+                ttc = None if ttc is None else ttc[b, sender].to(ego_lidar.device)
+                fused_features, _ = self._gate_output(output, selected_ages[-1], speed[b], ttc)
+                candidates.append((output['xyz'], fused_features))
+                if self.training and bool(batch['reference_valid'][b, sender]):
+                    # Current, undelayed features are supervision only, never inference input.
+                    modes = [(module, module.training) for module in self.backbone_other.modules()]
+                    devices = [ego_lidar.device.index] if ego_lidar.is_cuda else []
+                    try:
+                        self.backbone_other.eval()
+                        # Reference FPS/BN must not affect later causal messages.
+                        with torch.random.fork_rng(devices=devices), torch.no_grad():
+                            reference = batch['reference_lidar'][b, sender].to(ego_lidar).unsqueeze(0)
+                            ref_features, ref_xyz, _ = self.backbone_other(reference)
+                            ref_transform = batch['reference_transform'][b, sender].to(ego_lidar).unsqueeze(0)
+                            ref_xyz = self._transform_xyz(ref_xyz, ref_transform)
+                    finally:
+                        for module, mode in modes:
+                            module.training = mode
+                    self.temporal_aux.append({'output': output,
+                                              'reference_features': ref_features[0],
+                                              'reference_xyz': ref_xyz[0]})
+            all_candidates.append(candidates)
+        return self._fuse_temporal(points, xyz, ego_speed, all_candidates)
+
+    def _fuse_temporal(self, ego_points, ego_xyz, ego_speed, candidates):
+        groups = {}
+        for b, messages in enumerate(candidates):
+            points, xyz = ego_points[b:b+1], ego_xyz[b:b+1]
+            if messages:
+                remote_xyz = torch.cat([message[0] for message in messages], dim=0)
+                remote_points = torch.cat([message[1] for message in messages], dim=0)
+                pooled = self.voxel_pooling(remote_xyz.to('cpu'), remote_points.to('cpu'), voxel_size=0.5)
+                o_xyz, o_points = pooled.pooled_positions, pooled.pooled_features
+                if self.training:
+                    # User-approved training-only fix; native forward bits stay unchanged.
+                    o_points = zero_floor_backward(o_points)
+                mask = ((o_xyz[:, 0] >= -70) & (o_xyz[:, 0] <= 70) &
+                        (o_xyz[:, 1] >= -70) & (o_xyz[:, 1] <= 70) &
+                        (o_xyz[:, 2] > -2) & (o_xyz[:, 2] <= 0.25))
+                o_xyz, o_points = o_xyz[mask], o_points[mask]
+                if o_xyz.size(0):
+                    desired = xyz.shape[1]
+                    if o_xyz.size(0) < desired:
+                        indices = list(range(o_xyz.size(0)))
+                        indices.extend(random.choices(list(range(o_xyz.size(0))),
+                                                     k=desired-o_xyz.size(0)))
+                    else:
+                        indices = random.sample(range(o_xyz.size(0)), desired)
+                    indices = torch.tensor(indices, dtype=torch.long)
+                    xyz = torch.cat((xyz, o_xyz[indices].to(ego_xyz).unsqueeze(0)), dim=1)
+                    points = torch.cat((points, o_points[indices].to(ego_points).unsqueeze(0)), dim=1)
+            # Empty remote/ROI uses the same cooperative head on ego features.
+            groups.setdefault(xyz.shape[1], []).append((b, xyz, points))
+        rows = [None] * ego_xyz.size(0)
+        for members in groups.values():
+            xyz = torch.cat([member[1] for member in members], dim=0)
+            points = torch.cat([member[2] for member in members], dim=0)
+            xyz, points = self.aggr_transition_down(xyz, points)
+            points = self.aggr_transformer(xyz, points)[0]
+            indices = torch.tensor([member[0] for member in members], device=ego_speed.device)
+            meta = self.fc_meta(ego_speed[indices, None])
+            predictions = self.fc2(torch.cat((points.max(1).values, meta), dim=-1))
+            for i, member in enumerate(members):
+                rows[member[0]] = predictions[i:i+1]
+        predictions = torch.cat(rows, dim=0)
+        return predictions[:, 0], predictions[:, 1], predictions[:, 2]
+
+    def _forward_legacy(self, ego_lidar, ego_speed, other_lidar, other_transform):
         
         points, xyz, _ = self.backbone(ego_lidar)
         other_lidars = torch.split(other_lidar, 1, dim=1)
@@ -324,3 +543,4 @@ def hook_fn(m, i, o):
     except AttributeError: 
       print ("None found for Gradient")
   print("\n")    
+
