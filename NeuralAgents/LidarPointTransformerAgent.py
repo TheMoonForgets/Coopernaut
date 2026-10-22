@@ -37,12 +37,19 @@ from AVR import Utils
 from controller import ls_circle, project_point_to_circle, signed_angle
 #from .controller import PIDController, CustomController
 from models import PointTransformer, CooperativePointTransformer
+from cooperative.checkpoint import load_checkpoint
+from cooperative.online import OnlineContextBuilder
+from cooperative.publications import PublicationRecorder, baseline_publication_record
 
 class LidarPointTransformerAgent(AutonomousAgent):
     
     def __init__(self, path_to_conf_file, num_checkpoint=500):
         super().__init__(path_to_conf_file)
         config = yaml.load(open(path_to_conf_file),Loader=yaml.FullLoader)
+        temporal_settings = config.get('temporal', {'value': {'enabled': False}})
+        publication_log_dir = config.get('publication_log_dir')
+        if isinstance(publication_log_dir, dict) and 'value' in publication_log_dir:
+            publication_log_dir = publication_log_dir['value']
         self.num_commands = config['num_commands']['value']
         self.ego_only = config['ego_only']['value']
         self.shared = config['shared']['value']
@@ -78,6 +85,10 @@ class LidarPointTransformerAgent(AutonomousAgent):
         #config.frame_stack = self.frame_stack
         config.transformer_dim = self.transformer_dim
         config.max_num_neighbors = self.max_num_neighbors 
+        config.cpt = self.cpt
+        config.shared = self.shared
+        config.earlyfusion = self.earlyfusion
+        config.temporal = temporal_settings
         if self.cpt:
             print("Using Cooperative Point Transformer")
             model = CooperativePointTransformer(config).to(self.device)
@@ -86,8 +97,26 @@ class LidarPointTransformerAgent(AutonomousAgent):
             model = PointTransformer(config).to(self.device)
         model.eval()
         print("Loading model and initializing ", self.model_path)
-        model.load_state_dict(torch.load(self.model_path))
+        if self.cpt and model.temporal_config is not None:
+            if self.shared or self.earlyfusion:
+                raise ValueError('Delayed TARC requires unshared local CPT LiDAR input')
+            # Inference must have trained TARC weights; base-only bootstrap is training-only.
+            load_checkpoint(model, self.model_path, allow_pretrained=False)
+        else:
+            model.load_state_dict(torch.load(self.model_path))
         self.model = model
+        temporal_enabled = self.cpt and model.temporal_config is not None
+        if publication_log_dir is not None and (not self.cpt or self.shared or self.earlyfusion):
+            raise ValueError('Publication recording requires unshared local CPT LiDAR input')
+        self._temporal_builder = OnlineContextBuilder() if temporal_enabled or publication_log_dir is not None else None
+        self._temporal_episode_id = str(id(self))
+        self._publication_recorder = None
+        self._publication_seen = {}
+        if self._temporal_builder is not None and publication_log_dir is not None:
+            self._publication_recorder = PublicationRecorder(
+                publication_log_dir, self._temporal_episode_id,
+                model.temporal_config.delay_ms if temporal_enabled else 0)
+            print('Temporal publication trace:', self._publication_recorder.path)
         self.count = 0
         self.agent_trajectory_points_timestamp = []
         self.collider_trajectory_points_timestamp = []
@@ -165,6 +194,10 @@ class LidarPointTransformerAgent(AutonomousAgent):
             if hero_actor:
                 self._agent = NewAgent(hero_actor, self._target_speed)
         # Use NPC agent result
+        temporal_snapshot = None
+        if self._temporal_builder is not None:
+            # Pin all temporal poses to one actual world snapshot, not a fused sensor header.
+            temporal_snapshot = CarlaActorPool.get_hero_actor().get_world().get_snapshot()
         control = super().run_step(input_data, timestamp)
         # Obtain ego Lidar data and tranform it to be BEV
         lidar = input_data[str(self._agent.id)+Collaborator.LidarSensorName][1]
@@ -228,6 +261,7 @@ class LidarPointTransformerAgent(AutonomousAgent):
                 other_lidar = []
                 other_transform = []
                 other_speed = []
+                temporal_slots = []
                 num_valid_neighbors = 0
                 for key in sorted(self.other_states.keys()):
                     try:
@@ -265,6 +299,10 @@ class LidarPointTransformerAgent(AutonomousAgent):
                     other_lidar.append(list(self.other_states[key]['lidar']))
                     other_speed.append(self.other_states[key]['speed'])
                     other_transform.append(self.other_states[key]['transform'])
+                    if self._temporal_builder is not None:
+                        temporal_slots.append({'sender_id': other_agent_id,
+                                               'sensor_frame': None if other_agent_id is None else
+                                               int(input_data[str(other_agent_id)+'_LIDAR'][0])})
                 
                 if self.earlyfusion:
                     other_lidar_merge = []
@@ -286,7 +324,40 @@ class LidarPointTransformerAgent(AutonomousAgent):
                 if self.cpt:
                     other_lidar = torch.from_numpy(np.array([other_lidar])).float().to(self.device)
                     other_transform = torch.from_numpy(np.array([other_transform])).float().to(self.device)
-                    pred_throttle, pred_brake, pred_steer = self.model(ego_lidar, ego_speed, other_lidar, other_transform)
+                    if self._temporal_builder is None:
+                        pred_throttle, pred_brake, pred_steer = self.model(ego_lidar, ego_speed, other_lidar, other_transform)
+                    else:
+                        world_poses = {}
+                        for sender_id in other_actors:
+                            actor_snapshot = temporal_snapshot.find(int(sender_id))
+                            if actor_snapshot is None:
+                                continue
+                            pose = actor_snapshot.get_transform()
+                            pose.location.z = 0
+                            world_poses[sender_id] = np.array(Utils.TransformMatrix_WorldCoords(pose).matrix)
+                        ego_snapshot = temporal_snapshot.find(int(self._agent.id))
+                        if ego_snapshot is None:
+                            raise RuntimeError('Ego actor is missing from the pinned temporal snapshot')
+                        ego_pose = ego_snapshot.get_transform()
+                        ego_pose.location.z = 0
+                        temporal_ego_inverse = np.array(Utils.TransformMatrix_WorldCoords(ego_pose).inversematrix())
+                        velocity = ego_snapshot.get_velocity()
+                        speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2)
+                        context = self._temporal_builder.build(
+                            self._temporal_episode_id, int(temporal_snapshot.frame), temporal_ego_inverse,
+                            world_poses, temporal_slots, speed_mps)
+                        if self.model.temporal_config is None:
+                            # Record the actual selected baseline encoder inputs before training TARC.
+                            pred_throttle, pred_brake, pred_steer = self.model(
+                                ego_lidar, ego_speed, other_lidar, other_transform)
+                            publication = baseline_publication_record(context, self._publication_seen)
+                        else:
+                            pred_throttle, pred_brake, pred_steer = self.model(
+                                ego_lidar, ego_speed, other_lidar, other_transform,
+                                temporal_context=context)
+                            publication = self.model.temporal_publications
+                        if self._publication_recorder is not None:
+                            self._publication_recorder.write(publication)
                 elif self.earlyfusion:
                     pred_throttle, pred_brake, pred_steer = self.model(ego_lidar, ego_speed)
             else:
@@ -340,6 +411,18 @@ class LidarPointTransformerAgent(AutonomousAgent):
         return pred_control
 
 
+    def destroy(self):
+        recorder = getattr(self, '_publication_recorder', None)
+        if recorder is not None:
+            recorder.close()
+        builder = getattr(self, '_temporal_builder', None)
+        if builder is not None:
+            builder.reset()
+            self.model.reset_temporal_state()
+        parent_destroy = getattr(super(), 'destroy', None)
+        if parent_destroy is not None:
+            parent_destroy()
+
     def postprocess(self, steer, throttle, brake):
         control = carla.VehicleControl()
         control.steer = np.clip(steer, -1.0, 1.0)
@@ -378,3 +461,4 @@ if __name__ == '__main__':
     config = parser.parse_args()
     agent = LidarPointTransformerAgent(config.config)
     
+
